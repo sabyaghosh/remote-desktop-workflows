@@ -1,4 +1,4 @@
-name: RICH LINUX (SMART GNOME) - FIXED
+name: RICH LINUX (SMART GNOME) - TAILSCALE
 
 on:
   workflow_dispatch:
@@ -8,42 +8,42 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
 
-    steps:
-      - name: Install Cloudflared
-        run: |
-          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /tmp/cloudflared
-          chmod +x /tmp/cloudflared
-          sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
+    # Uncomment this only if TAILSCALE_AUTH_KEY is stored as a GitHub Environment secret
+    # environment: your-environment-name
 
+    steps:
       - name: Smart GNOME Install (No Bloat)
         run: |
           sudo apt-get update
-          
-          # Remove heavy tools that cause hangs
+
+          # Remove heavy tools that may slow things down
           sudo apt-get remove -y --purge man-db firewalld ufw || true
-          
-          # Install ONLY the GUI parts of GNOME (Skipping Kernel/System updates)
-          # Using --no-install-recommends to speed up drastically
+
+          # Install lightweight GNOME desktop parts
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             gnome-session gnome-shell gnome-terminal nautilus \
             dbus-x11 x11-xserver-utils xorg \
-            adwaita-icon-theme-full fonts-cantarell
-          
-          echo "✅ GUI Installed (Lightweight Mode)"
+            adwaita-icon-theme-full fonts-cantarell \
+            curl ca-certificates
+
+          echo "GUI Installed"
 
       - name: Install XRDP (Remote Desktop)
         run: |
           sudo apt-get install -y --no-install-recommends xrdp
-          sudo adduser xrdp ssl-cert
-          
-          # Configure XRDP to use GNOME
-          echo "gnome-session" > ~/.xsession
-          sudo sed -i 's/3389/3389/g' /etc/xrdp/xrdp.ini
+          sudo adduser xrdp ssl-cert || true
+
+          # Make sure XRDP starts GNOME for the runner user
+          echo "gnome-session" | sudo tee /home/runner/.xsession >/dev/null
+          sudo chown runner:runner /home/runner/.xsession
+
           sudo systemctl enable xrdp
-          sudo service xrdp start
+          sudo systemctl restart xrdp
 
       - name: Install VS Code & Antigravity (Chrome)
         run: |
+          set -e
+
           # VS Code
           wget -qO- https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > packages.microsoft.gpg
           sudo install -D -o root -g root -m 644 packages.microsoft.gpg /etc/apt/keyrings/packages.microsoft.gpg
@@ -51,13 +51,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y code
 
-          # Chrome (for Antigravity)
-          wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          # Chrome
+          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
           sudo apt install -y ./google-chrome-stable_current_amd64.deb || sudo apt-get install -f -y
 
-          # Desktop Shortcut
-          mkdir -p ~/Desktop
-          cat > ~/Desktop/Antigravity.desktop <<EOF
+          # Desktop shortcut
+          sudo -u runner mkdir -p /home/runner/Desktop
+          cat <<'EOF' | sudo tee /home/runner/Desktop/Antigravity.desktop >/dev/null
           [Desktop Entry]
           Version=1.0
           Name=Google Antigravity
@@ -65,36 +65,61 @@ jobs:
           Icon=google-chrome
           Type=Application
           EOF
-          chmod +x ~/Desktop/Antigravity.desktop
+          sudo chmod +x /home/runner/Desktop/Antigravity.desktop
+          sudo chown runner:runner /home/runner/Desktop/Antigravity.desktop
 
       - name: Setup User (runner)
         run: |
-          sudo useradd -m -s /bin/bash runner || true
           echo "runner:Antigravity2026!" | sudo chpasswd
           sudo usermod -aG sudo runner
 
-      - name: Start Cloudflare Tunnel (RDP)
+      - name: Install Tailscale
         run: |
-          /usr/local/bin/cloudflared tunnel --url tcp://localhost:3389 > tunnel.log 2>&1 &
-          
-          echo "Waiting for URL..."
-          for i in {1..30}; do
-            sleep 2
-            TUN=$(grep -Eo 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
-            if [ -n "$TUN" ]; then echo "🌐 Tunnel: $TUN"; break; fi
-          done
-          echo "$TUN" > tunnel_url.txt
+          curl -fsSL https://tailscale.com/install.sh | sudo sh
 
-      - name: SHOW CONNECT INFO
+      - name: Establish Tailscale Connection
         run: |
-          TUN=$(cat tunnel_url.txt)
+          sudo systemctl enable --now tailscaled
+
+          sudo tailscale up \
+            --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" \
+            --hostname="gh-linux-${GITHUB_RUN_ID}" \
+            --accept-routes=false \
+            --accept-dns=true
+
+          TS_IP=""
+          for i in {1..20}; do
+            TS_IP=$(sudo tailscale ip -4 | head -n 1 || true)
+            if [ -n "$TS_IP" ]; then
+              break
+            fi
+            sleep 3
+          done
+
+          if [ -z "$TS_IP" ]; then
+            echo "Tailscale IP not assigned"
+            sudo tailscale status || true
+            exit 1
+          fi
+
+          echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
+
+      - name: Verify XRDP Accessibility
+        run: |
+          sudo systemctl status xrdp --no-pager
+          sudo ss -tlnp | grep ':3389' || (echo "XRDP is not listening on 3389" && exit 1)
+
+      - name: Show Connect Info
+        run: |
           echo "==================================================="
-          echo "   RICH GNOME DESKTOP READY (Smart Version)"
+          echo "   RICH GNOME DESKTOP READY (Tailscale Version)"
           echo "==================================================="
-          echo "Command: cloudflared access tcp --hostname ${TUN#https://} --url localhost:3389"
+          echo "Host   : $TAILSCALE_IP"
+          echo "Port   : 3389"
           echo "User   : runner"
           echo "Pass   : Antigravity2026!"
           echo "==================================================="
+          echo "Use any RDP client from a device logged into the same Tailscale tailnet."
 
       - name: Keep Alive
         run: sleep 21600
